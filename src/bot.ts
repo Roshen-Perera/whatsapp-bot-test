@@ -18,8 +18,13 @@ const carts = new Map<string, OrderItem[]>();   // userId -> items
 const orders = new Map<string, Order[]>();      // userId -> order history
 
 // ===== whatsapp client =====
-const client = new Client({ authStrategy: new LocalAuth() });
-
+const client = new Client({
+    authStrategy: new LocalAuth(),
+    puppeteer: {
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox']
+    }
+});
 client.on('qr', (qr: string) => {
     console.log('📱 Scan this QR code with your WhatsApp app:');
     qrcode.generate(qr, { small: true });
