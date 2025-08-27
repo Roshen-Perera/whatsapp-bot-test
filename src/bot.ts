@@ -1,232 +1,253 @@
 import { Client, LocalAuth, Message } from 'whatsapp-web.js';
-import express from 'express';
-import QRCode from 'qrcode';
+import * as qrcode from 'qrcode-terminal';
+import { config } from './config';
+import {
+    ProductCategory, ProductItem, Order, OrderItem, OrderStatus
+} from './types';
+import { categoryLabels, formatProductList } from './lib/format';
+import { listByCategory, searchProducts, findById, calcTotal } from './lib/logic';
 
-// ------------------------ EXPRESS SERVER ------------------------
-const app = express();
-const PORT = process.env.PORT || 3000;
-
-// Temporary QR URL (updated on 'qr' event)
-let qrDataUrl: string | null = null;
-
-app.get('/qr', (_req: any, res: { send: (arg0: string) => any; writeHead: (arg0: number, arg1: { 'Content-Type': string; 'Content-Length': number; }) => void; end: (arg0: Buffer<ArrayBuffer>) => void; }) => {
-    if (!qrDataUrl) return res.send('QR not generated yet.');
-    const img = Buffer.from(qrDataUrl.split(',')[1], 'base64');
-    res.writeHead(200, {
-        'Content-Type': 'image/png',
-        'Content-Length': img.length
-    });
-    res.end(img);
-});
-
-app.listen(PORT, () => console.log(`🚀 Express running on port ${PORT}`));
-
-// ------------------------ BOT LOGIC ------------------------
+// ===== simple in-memory stores =====
 interface UserData {
     name: string | null;
     visits: number;
     lastMessage: Date;
 }
+const users = new Map<string, UserData>();
+const carts = new Map<string, OrderItem[]>();   // userId -> items
+const orders = new Map<string, Order[]>();      // userId -> order history
 
-interface BotResponse {
-    text: string;
-    shouldReply: boolean;
-}
-
-const userData: Map<string, UserData> = new Map();
-
-// Puppeteer flags for cloud deployment
+// ===== whatsapp client =====
 const client = new Client({
-    authStrategy: new LocalAuth({ clientId: 'jayabima' }),
+    authStrategy: new LocalAuth(),
     puppeteer: {
         headless: true,
         args: ['--no-sandbox', '--disable-setuid-sandbox']
     }
 });
-
-// QR event
-client.on('qr', async (qr: string) => {
-    console.log('📱 QR generated! Visit /qr to scan it.');
-    qrDataUrl = await QRCode.toDataURL(qr);
+client.on('qr', (qr: string) => {
+    console.log('📱 Scan this QR code with your WhatsApp app:');
+    qrcode.generate(qr, { small: true });
+    const shortCode = qr.slice(0, 8);
+    console.log(`📱 Scan this WhatsApp QR code: ${shortCode}`);
 });
 
-// Ready
-client.on('ready', () => console.log('✅ Jayabima Hardware Bot is ready!'));
-
-// Incoming messages
-client.on('message', async (message: Message) => {
-    try {
-        const userId = message.from;
-        if (shouldSkipMessage(userId)) return;
-
-        const botResponse = await processMessage(message, userId);
-        if (botResponse.shouldReply && botResponse.text) {
-            await message.reply(botResponse.text);
-        }
-    } catch (err) {
-        console.error('❌ Error processing message:', err);
-        await message.reply('Sorry, something went wrong. Please try again.');
-    }
+client.on('ready', () => {
+    console.log('✅ Jayabima Hardware Bot is ready!');
 });
 
-// Skip groups and status
+client.on('auth_failure', () => console.error('❌ Authentication failed'));
+client.on('disconnected', (reason: string) => console.log('📱 Disconnected:', reason));
+client.on('error', (error: Error) => console.error('❌ Client error:', error));
+
+// ===== helpers =====
 function shouldSkipMessage(userId: string): boolean {
     return userId.includes('@g.us') || userId === 'status@broadcast';
 }
 
-// Get or init user
-function getUserData(userId: string): UserData {
-    if (!userData.has(userId)) {
-        userData.set(userId, { name: null, visits: 0, lastMessage: new Date() });
+function getUser(userId: string): UserData {
+    if (!users.has(userId)) {
+        users.set(userId, { name: null, visits: 0, lastMessage: new Date() });
     }
-    const user = userData.get(userId)!;
-    user.visits++;
-    user.lastMessage = new Date();
-    return user;
+    const u = users.get(userId)!;
+    u.visits++;
+    u.lastMessage = new Date();
+    return u;
 }
 
-// Process message
-async function processMessage(message: Message, userId: string): Promise<BotResponse> {
-    const user = getUserData(userId);
-    const userMessage = message.body.toLowerCase().trim();
+function ensureCart(userId: string): OrderItem[] {
+    if (!carts.has(userId)) carts.set(userId, []);
+    return carts.get(userId)!;
+}
 
+function newOrderId() {
+    return `ORD-${Date.now()}`;
+}
+
+// ===== message routing =====
+client.on('message', async (message: Message) => {
+    const userId = message.from;
+    if (shouldSkipMessage(userId)) return;
+
+    const text = (message.body || '').trim();
+    const lower = text.toLowerCase();
+
+    const user = getUser(userId);
+
+    // first-time welcome
     if (user.visits === 1) {
-        return {
-            text: '🏪 Welcome to **Jayabima Hardware**!\n\nMay I know your name?',
-            shouldReply: true
+        await message.reply(
+            `🏪 Welcome to *${config.store.name}*!\n` +
+            `May I know your name? (This helps me serve you better)`
+        );
+        return;
+    }
+
+    // if no name yet and not a command, treat as name
+    if (!user.name && !/^(help|products|cement|paint|tools|plumbing|electrical|offers|hours|location|contact|check|add|cart|clear|confirm)\b/i.test(lower)) {
+        user.name = text;
+        await message.reply(
+            `Nice to meet you, ${user.name}! 😊\n` +
+            `Type *products* to see categories or *help* for all commands.`
+        );
+        return;
+    }
+
+    // commands
+    if (/^help$/i.test(lower)) return void message.reply(helpText());
+    if (/^(hi|hello|hey)$/i.test(lower)) return void message.reply(greet(user.name));
+
+    if (/^products$/i.test(lower)) {
+        const list =
+            `🛠️ *PRODUCT CATEGORIES*\n\n` +
+            `• ${categoryLabels.cement} — type *cement*\n` +
+            `• ${categoryLabels.paint} — type *paint*\n` +
+            `• ${categoryLabels.tools} — type *tools*\n` +
+            `• ${categoryLabels.plumbing} — type *plumbing*\n` +
+            `• ${categoryLabels.electrical} — type *electrical*`;
+        return void message.reply(list);
+    }
+
+    if (/^cement$/i.test(lower)) {
+        return void message.reply(formatProductList(listByCategory(ProductCategory.CEMENT), categoryLabels.cement));
+    }
+    if (/^paint$/i.test(lower)) {
+        return void message.reply(formatProductList(listByCategory(ProductCategory.PAINT), categoryLabels.paint));
+    }
+    if (/^tools$/i.test(lower)) {
+        return void message.reply(formatProductList(listByCategory(ProductCategory.TOOLS), categoryLabels.tools));
+    }
+    if (/^plumbing$/i.test(lower)) {
+        return void message.reply(formatProductList(listByCategory(ProductCategory.PLUMBING), categoryLabels.plumbing));
+    }
+    if (/^electrical$/i.test(lower)) {
+        return void message.reply(formatProductList(listByCategory(ProductCategory.ELECTRICAL), categoryLabels.electrical));
+    }
+
+    // stock/price check: "check <keyword>"
+    const checkMatch = lower.match(/^check\s+(.+)/i);
+    if (checkMatch) {
+        const keyword = checkMatch[1];
+        const results = searchProducts(keyword);
+        if (!results.length) return void message.reply(`No products found for "${keyword}". Try a different keyword or type *products*.`);
+        const top = results.slice(0, 6);
+        const lines = top.map(p => `• ${p.name} [${p.id}] — Rs. ${p.price.toLocaleString()} (${p.available ? 'In stock' : 'Out of stock'})`);
+        return void message.reply(`🔎 *Search results*\n\n${lines.join('\n')}\n\n➡️ Use: *add <ID> <qty>*`);
+    }
+
+    // add to cart: "add <id> <qty>"
+    const addMatch = lower.match(/^add\s+([a-z0-9-]+)\s+(\d+)/i);
+    if (addMatch) {
+        const [, id, qtyStr] = addMatch;
+        const qty = Math.max(1, parseInt(qtyStr, 10) || 1);
+        const product = findById(id);
+        if (!product) return void message.reply(`I couldn't find product with ID *${id}*. Type *check <keyword>* or *products*.`);
+        if (!product.available) return void message.reply(`*${product.name}* is currently out of stock.`);
+        const cart = ensureCart(userId);
+        cart.push({ product, quantity: qty });
+        const subtotal = product.price * qty;
+        return void message.reply(`🧺 Added *${product.name}* x ${qty} — Rs. ${subtotal.toLocaleString()}\nType *cart* to view your cart or *confirm* to place order.`);
+    }
+
+    // view cart
+    if (/^cart$/i.test(lower)) {
+        const cart = ensureCart(userId);
+        if (!cart.length) return void message.reply('Your cart is empty. Add items using *add <ID> <qty>*.');
+        const lines = cart.map(it => `• ${it.product.name} x ${it.quantity} — Rs. ${(it.product.price * it.quantity).toLocaleString()}`);
+        const total = calcTotal(cart);
+        return void message.reply(`🧺 *Your Cart*\n\n${lines.join('\n')}\n\n*Total:* Rs. ${total.toLocaleString()}\n\nCommands: *confirm*, *clear*`);
+    }
+
+    // clear cart
+    if (/^clear$/i.test(lower)) {
+        carts.set(userId, []);
+        return void message.reply('🧹 Cart cleared.');
+    }
+
+    // confirm order
+    if (/^confirm$/i.test(lower)) {
+        const cart = ensureCart(userId);
+        if (!cart.length) return void message.reply('Your cart is empty. Add items first with *add <ID> <qty>*.');
+        const order: Order = {
+            id: newOrderId(),
+            userId,
+            items: cart,
+            total: calcTotal(cart),
+            status: OrderStatus.PENDING,
+            createdAt: new Date()
         };
+        // save
+        carts.set(userId, []);
+        if (!orders.has(userId)) orders.set(userId, []);
+        orders.get(userId)!.push(order);
+        return void message.reply(
+            `✅ *Order placed!* ID: ${order.id}\n` +
+            `Total: Rs. ${order.total.toLocaleString()}\n` +
+            `We’ll contact you shortly at this number to confirm delivery/pickup.\n` +
+            `📞 ${config.store.phone}`
+        );
     }
 
-    if (!user.name && !isCommand(userMessage)) {
-        user.name = message.body.trim();
-        return {
-            text: `Nice to meet you, ${user.name}! 😊\nType "products" to see categories or "help" for commands.`,
-            shouldReply: true
-        };
+    // info commands
+    if (/^offers?$/i.test(lower)) {
+        return void message.reply(
+            `🎉 *Current Offers*\n` +
+            `• Buy 5 bags of cement → FREE delivery.\n` +
+            `• 10% OFF on paints above Rs. 10,000.\n` +
+            `• Special discounts on Bosch tools.\n\n` +
+            `*Valid until end of month.*`
+        );
     }
 
-    return handleUserMessage(userMessage, user);
-}
-
-// Check commands
-function isCommand(message: string): boolean {
-    const commands = ['products', 'help', 'hours', 'location', 'order', 'contact', 'hello', 'hi'];
-    return commands.some(cmd => message.includes(cmd));
-}
-
-// Handle user messages
-function handleUserMessage(msg: string, user: UserData): BotResponse {
-    const name = user.name || 'customer';
-
-    if (['hello', 'hi', 'hey'].some(g => msg.includes(g))) {
-        return { text: `Hello ${name}! 👋 Welcome back to **Jayabima Hardware**.\nType "help" to see options.`, shouldReply: true };
+    if (/^hours?|open$/i.test(lower)) {
+        return void message.reply(
+            `⏰ *Opening Hours*\n` +
+            `Mon–Sat: 8:00 AM – 6:00 PM\n` +
+            `Sun: 8:00 AM – 1:00 PM`
+        );
     }
 
-    if (msg.includes('products') || msg.includes('items') || msg.includes('materials')) {
-        return { text: getProductsResponse(), shouldReply: true };
+    if (/^location|address$/i.test(lower)) {
+        return void message.reply(
+            `📍 *${config.store.name}*\n${config.store.address}\n\n` +
+            `🚚 Delivery available within city limits.`
+        );
     }
 
-    if (msg.includes('cement')) return { text: getCementMenu(), shouldReply: true };
-    if (msg.includes('paint')) return { text: getPaintMenu(), shouldReply: true };
-    if (msg.includes('tools')) return { text: getToolsMenu(), shouldReply: true };
-    if (msg.includes('plumbing')) return { text: getPlumbingMenu(), shouldReply: true };
-    if (msg.includes('hours') || msg.includes('open')) return { text: getHoursResponse(), shouldReply: true };
-    if (msg.includes('location') || msg.includes('address')) return { text: getLocationResponse(), shouldReply: true };
-    if (msg.includes('order')) return { text: getOrderResponse(), shouldReply: true };
-    if (msg.includes('contact') || msg.includes('phone')) return { text: getContactResponse(), shouldReply: true };
-    if (msg.includes('offer') || msg.includes('discount')) return { text: getOffersResponse(), shouldReply: true };
-    if (msg === 'help' || msg === '?') return { text: getHelpResponse(), shouldReply: true };
+    if (/^contact|phone$/i.test(lower)) {
+        return void message.reply(
+            `📞 *Contact*\nPhone: ${config.store.phone}\nEmail: ${config.store.email}`
+        );
+    }
 
-    return { text: getDefaultResponse(), shouldReply: true };
+    // fallback
+    return void message.reply(
+        `I didn't quite understand.\n\n` +
+        `Try:\n• *products* — categories\n• *check cement* — search\n• *add CEM-TS-50 3* — add to cart\n• *cart* — view cart\n• *help* — all commands`
+    );
+});
+
+// ===== helpers (text) =====
+function greet(name: string | null): string {
+    const who = name ?? 'customer';
+    return `Hello ${who}! 👋 How can I help you today?\nType *products* to browse or *help* for all commands.`;
 }
 
-// ------------------------ RESPONSES ------------------------
-function getProductsResponse() {
-    return `🛠️ **PRODUCT CATEGORIES**  
-🧱 Cement & Building Materials (Type "cement")  
-🎨 Paints & Finishing (Type "paint")  
-🔧 Tools & Hardware (Type "tools")  
-🚰 Plumbing & Fittings (Type "plumbing")`;
+function helpText(): string {
+    return (
+        `🤖 *Commands*\n\n` +
+        `• *products* — show categories\n` +
+        `• *cement* / *paint* / *tools* / *plumbing* / *electrical* — list items\n` +
+        `• *check <keyword>* — search products\n` +
+        `• *add <ID> <qty>* — add to cart (e.g., add CEM-TS-50 3)\n` +
+        `• *cart* — view your cart\n` +
+        `• *confirm* — place an order\n` +
+        `• *clear* — clear cart\n` +
+        `• *offers* — current promotions\n` +
+        `• *hours* / *location* / *contact*\n`
+    );
 }
 
-function getCementMenu() {
-    return `🧱 **CEMENT & BUILDING MATERIALS**  
-- Tokyo Super Cement (50kg) - Rs. 2,200  
-- Holcim Cement (50kg) - Rs. 2,150  
-- INSEE Cement (50kg) - Rs. 2,180`;
-}
-
-function getPaintMenu() {
-    return `🎨 **PAINTS & FINISHING**  
-- Nippon Weatherbond  
-- JAT Woodcare & Varnish  
-- Dulux Emulsion Paints`;
-}
-
-function getToolsMenu() {
-    return `🔧 **TOOLS & HARDWARE**  
-- Hammers, Screwdrivers, Spanners  
-- Drills, Grinders, Ladders`;
-}
-
-function getPlumbingMenu() {
-    return `🚰 **PLUMBING & FITTINGS**  
-- PVC Pipes & Fittings  
-- Water Tanks (500L - 5000L)  
-- Faucets, Showers, Mixers`;
-}
-
-function getHoursResponse() {
-    return `⏰ **OPENING HOURS**  
-Mon-Sat: 8:00 AM - 6:00 PM  
-Sun: 8:00 AM - 1:00 PM`;
-}
-
-function getLocationResponse() {
-    return `📍 **JAYABIMA HARDWARE**  
-123 Main Street, Kurunegala, Sri Lanka`;
-}
-
-function getOrderResponse() {
-    return `🛒 **HOW TO ORDER**  
-1️⃣ Send item name & quantity  
-2️⃣ Call: 037-1234567  
-3️⃣ Visit store`;
-}
-
-function getContactResponse() {
-    return `📞 **CONTACT DETAILS**  
-Phone: 037-1234567  
-Email: jayabimahardware@gmail.com`;
-}
-
-function getOffersResponse() {
-    return `🎉 **OFFERS**  
-- Buy 5 bags of cement → FREE delivery  
-- 10% OFF on paints above Rs. 10,000`;
-}
-
-function getHelpResponse() {
-    return `🤖 **COMMANDS**  
-- "products" → Categories  
-- "cement" / "paint" / "tools" / "plumbing" → Details  
-- "hours" → Opening times  
-- "location" → Store address  
-- "order" → How to order  
-- "contact" → Phone & email  
-- "offers" → Current deals`;
-}
-
-function getDefaultResponse() {
-    return `🤔 Sorry, I didn’t understand.  
-Try "products", "offers" or "help".`;
-}
-
-// ------------------------ ERROR HANDLERS ------------------------
-client.on('auth_failure', () => console.error('❌ Authentication failed'));
-client.on('disconnected', reason => console.log('📱 Disconnected:', reason));
-client.on('error', error => console.error('❌ Client error:', error));
-
-// ------------------------ START BOT ------------------------
+// ===== start =====
 console.log('🚀 Starting Jayabima Hardware WhatsApp Bot...');
 client.initialize();
