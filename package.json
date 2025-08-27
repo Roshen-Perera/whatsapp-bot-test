@@ -17,5 +17,10 @@
   "bugs": {
     "url": "https://github.com/Roshen-Perera/whatsapp-bot-test/issues"
   },
-  "homepage": "https://github.com/Roshen-Perera/whatsapp-bot-test#readme"
+  "homepage": "https://github.com/Roshen-Perera/whatsapp-bot-test#readme",
+  "dependencies": {
+    "dotenv": "^17.2.1",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.32.0"
+  }
 }
